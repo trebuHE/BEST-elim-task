@@ -6,9 +6,11 @@
 #define VERTICAL_SCAN_THRESHOLD   15
 #define HORIZONTAL_SCAN_THRESHOLD 10
 #define SYN_FLOOD_MIN_SYNS        40
+#define UDP_FLOOD_THRESHOLD       50
 #define TRACKER_HASH_SIZE    512
 #define SWEEP_HASH_SIZE      512
 #define SYN_TARGET_HASH_SIZE 512
+#define UDP_TARGET_HASH_SIZE 512
 
 typedef struct host_pair_tracker {
     char      src_ip[MAX_IP_STR_LEN];
@@ -43,19 +45,28 @@ typedef struct syn_target_tracker {
     struct syn_target_tracker *next;
 } syn_target_tracker_t;
 
+typedef struct udp_target_tracker {
+    char           dst_ip[MAX_IP_STR_LEN];
+    uint16_t       dst_port;
+    uint64_t       packet_count;
+    uint64_t       byte_count;
+    struct timeval first_ts;
+    struct timeval last_ts;
+    char           dominant_src[MAX_IP_STR_LEN];
+    uint64_t       dominant_src_count;
+    bool           alerted;
+    struct udp_target_tracker *next;
+} udp_target_tracker_t;
+
 struct threat_detector {
     threat_alert_t        *alerts;
     size_t                 alert_count;
     size_t                 alert_cap;
 
-    /* Vertical scan tracking per host pair */
     host_pair_tracker_t   *trackers[TRACKER_HASH_SIZE];
-
-    /* Horizontal sweep tracking per (src_ip, port, proto) */
     sweep_tracker_t       *sweeps[SWEEP_HASH_SIZE];
-
-    /* YN flood tracking per destination (dst_ip, dst_port) */
     syn_target_tracker_t  *syn_targets[SYN_TARGET_HASH_SIZE];
+    udp_target_tracker_t  *udp_targets[UDP_TARGET_HASH_SIZE];
 };
 
 const char *threat_severity_to_string(threat_severity_t sev) {
@@ -121,6 +132,15 @@ void threat_detector_free(threat_detector_t *d) {
         syn_target_tracker_t *cur = d->syn_targets[i];
         while (cur) {
             syn_target_tracker_t *next = cur->next;
+            free(cur);
+            cur = next;
+        }
+    }
+
+    for (size_t i = 0; i < UDP_TARGET_HASH_SIZE; i++) {
+        udp_target_tracker_t *cur = d->udp_targets[i];
+        while (cur) {
+            udp_target_tracker_t *next = cur->next;
             free(cur);
             cur = next;
         }
@@ -544,16 +564,121 @@ static void check_syn_flood(threat_detector_t *d, const packet_record_t *pkt) {
     }
 }
 
+static uint32_t hash_udp_target(const char *dst, uint16_t port) {
+    uint32_t h = 5381;
+    while (*dst) h = ((h << 5) + h) + (unsigned char)*dst++;
+    h = h ^ ((uint32_t)port << 9);
+    return h % UDP_TARGET_HASH_SIZE;
+}
+
+static udp_target_tracker_t *find_or_create_udp_target(threat_detector_t *d, const char *dst, uint16_t port, const struct timeval *ts) {
+    uint32_t idx = hash_udp_target(dst, port);
+    udp_target_tracker_t *cur = d->udp_targets[idx];
+    while (cur) {
+        if (cur->dst_port == port && strncmp(cur->dst_ip, dst, sizeof(cur->dst_ip)) == 0) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+
+    udp_target_tracker_t *node = calloc(1, sizeof(udp_target_tracker_t));
+    if (!node) return NULL;
+    snprintf(node->dst_ip, sizeof(node->dst_ip), "%s", dst);
+    node->dst_port = port;
+    node->first_ts = *ts;
+    node->last_ts = *ts;
+
+    node->next = d->udp_targets[idx];
+    d->udp_targets[idx] = node;
+    return node;
+}
+
+static void record_udp_flood_alert(threat_detector_t *d, const udp_target_tracker_t *tr) {
+    const char *attacker = (tr->dominant_src[0] != '\0') ? tr->dominant_src : "Distributed/Multiple";
+
+    double duration = (tr->last_ts.tv_sec - tr->first_ts.tv_sec) +
+                      (tr->last_ts.tv_usec - tr->first_ts.tv_usec) / 1000000.0;
+    if (duration < 0.001) duration = 0.001;
+    double pps = (double)tr->packet_count / duration;
+
+    for (size_t i = 0; i < d->alert_count; i++) {
+        threat_alert_t *a = &d->alerts[i];
+        if (a->type == THREAT_UDP_FLOOD &&
+            a->dst_port == tr->dst_port &&
+            strncmp(a->dst_ip, tr->dst_ip, sizeof(a->dst_ip)) == 0) {
+            
+            a->packet_count = tr->packet_count;
+            a->timestamp = tr->last_ts;
+            snprintf(a->description, sizeof(a->description),
+                     "UDP flood/burst on port %u (%lu pkts, %.1f KB, %.1f pps)",
+                     tr->dst_port, (unsigned long)tr->packet_count,
+                     tr->byte_count / 1024.0, pps);
+            return;
+        }
+    }
+
+    if (d->alert_count >= d->alert_cap) {
+        size_t new_cap = d->alert_cap * 2;
+        threat_alert_t *resized = realloc(d->alerts, new_cap * sizeof(threat_alert_t));
+        if (!resized) return;
+        d->alerts = resized;
+        d->alert_cap = new_cap;
+    }
+
+    threat_alert_t *new_alert = &d->alerts[d->alert_count++];
+    memset(new_alert, 0, sizeof(threat_alert_t));
+    new_alert->timestamp = tr->last_ts;
+    new_alert->type = THREAT_UDP_FLOOD;
+    new_alert->severity = (pps >= 500.0 || tr->packet_count >= 100) ? SEV_CRITICAL : SEV_HIGH;
+    snprintf(new_alert->src_ip, sizeof(new_alert->src_ip), "%s", attacker);
+    snprintf(new_alert->dst_ip, sizeof(new_alert->dst_ip), "%s", tr->dst_ip);
+    new_alert->src_port = 0;
+    new_alert->dst_port = tr->dst_port;
+    new_alert->protocol = PROTO_UDP;
+    new_alert->packet_count = tr->packet_count;
+    snprintf(new_alert->description, sizeof(new_alert->description),
+             "UDP flood/burst on port %u (%lu pkts, %.1f KB, %.1f pps)",
+             tr->dst_port, (unsigned long)tr->packet_count,
+             tr->byte_count / 1024.0, pps);
+}
+
+static void check_udp_flood(threat_detector_t *d, const packet_record_t *pkt) {
+    if (pkt->protocol != PROTO_UDP) {
+        return;
+    }
+
+    udp_target_tracker_t *tr = find_or_create_udp_target(d, pkt->dst_ip, pkt->dst_port, &pkt->timestamp);
+    if (!tr) return;
+
+    tr->packet_count++;
+    tr->byte_count += pkt->wirelen;
+    tr->last_ts = pkt->timestamp;
+
+    if (tr->dominant_src[0] == '\0') {
+        snprintf(tr->dominant_src, sizeof(tr->dominant_src), "%s", pkt->src_ip);
+        tr->dominant_src_count = 1;
+    } else if (strncmp(tr->dominant_src, pkt->src_ip, sizeof(tr->dominant_src)) == 0) {
+        tr->dominant_src_count++;
+    } else if (tr->dominant_src_count > 0) {
+        tr->dominant_src_count--;
+    } else {
+        snprintf(tr->dominant_src, sizeof(tr->dominant_src), "%s", pkt->src_ip);
+        tr->dominant_src_count = 1;
+    }
+
+    if (tr->packet_count >= UDP_FLOOD_THRESHOLD) {
+        record_udp_flood_alert(d, tr);
+    }
+}
+
 void threat_detector_process_packet(threat_detector_t *detector, const packet_record_t *pkt) {
     if (!detector || !pkt) return;
 
     check_stealth_scans(detector, pkt);
-
     check_vertical_scan(detector, pkt);
-
     check_horizontal_scan(detector, pkt);
-
     check_syn_flood(detector, pkt);
+    check_udp_flood(detector, pkt);
 }
 
 void threat_detector_finalize(threat_detector_t *detector) {
@@ -564,6 +689,16 @@ void threat_detector_finalize(threat_detector_t *detector) {
         while (tr) {
             if (tr->syn_count >= SYN_FLOOD_MIN_SYNS && tr->syn_count > 4 * (tr->ack_count + 1)) {
                 record_syn_flood_alert(detector, tr);
+            }
+            tr = tr->next;
+        }
+    }
+
+    for (size_t i = 0; i < UDP_TARGET_HASH_SIZE; i++) {
+        udp_target_tracker_t *tr = detector->udp_targets[i];
+        while (tr) {
+            if (tr->packet_count >= UDP_FLOOD_THRESHOLD) {
+                record_udp_flood_alert(detector, tr);
             }
             tr = tr->next;
         }
