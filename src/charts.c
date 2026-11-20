@@ -283,3 +283,152 @@ int charts_generate_throughput(const traffic_stats_t *stats, const char *output_
 
     return 0;
 }
+
+int charts_generate_packet_size_histogram(const traffic_stats_t *stats, const char *output_path) {
+    if (!stats || !output_path || output_path[0] == '\0') {
+        fprintf(stderr, "Invalid packet size histogram arguments\n");
+        return -1;
+    }
+
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                          CHART_WIDTH, CHART_HEIGHT);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Failed to create chart surface\n");
+        cairo_surface_destroy(surface);
+        return -1;
+    }
+
+    cairo_t *cr = cairo_create(surface);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+
+    set_color(cr, COLOR_BG);
+    cairo_paint(cr);
+
+    draw_label(cr, "Packet Size Histogram", PLOT_LEFT, 38.0, 24.0, true, COLOR_TEXT, 0.0);
+
+    const uint64_t *histogram = traffic_stats_get_histogram(stats);
+    uint64_t total = 0;
+    for (int i = 0; i < HISTO_BIN_COUNT; i++) {
+        total += histogram ? histogram[i] : 0;
+    }
+
+    char subtitle[96];
+    snprintf(subtitle, sizeof(subtitle), "Frame size distribution across %lu packets",
+             (unsigned long)total);
+    draw_label(cr, subtitle, PLOT_LEFT, 60.0, 12.0, false, COLOR_MUTED, 0.0);
+
+    double plot_left = PLOT_LEFT;
+    double plot_top = PLOT_TOP;
+    double plot_width = CHART_WIDTH - PLOT_LEFT - PLOT_RIGHT;
+    double plot_height = CHART_HEIGHT - PLOT_TOP - PLOT_BOTTOM;
+    double plot_bottom = plot_top + plot_height;
+
+    set_color(cr, COLOR_PLOT_BG);
+    cairo_rectangle(cr, plot_left, plot_top, plot_width, plot_height);
+    cairo_fill(cr);
+
+    cairo_set_line_width(cr, 1.0);
+    set_color(cr, COLOR_BORDER);
+    cairo_rectangle(cr, plot_left, plot_top, plot_width, plot_height);
+    cairo_stroke(cr);
+
+    if (!histogram || total == 0) {
+        draw_label(cr, "No packet data", plot_left + plot_width / 2.0,
+                   plot_top + plot_height / 2.0, 18.0, true, COLOR_MUTED, 0.5);
+        cairo_show_page(cr);
+        cairo_destroy(cr);
+        cairo_status_t status = cairo_surface_write_to_png(surface, output_path);
+        cairo_surface_destroy(surface);
+
+        if (status != CAIRO_STATUS_SUCCESS) {
+            fprintf(stderr, "Failed to write PNG '%s': %s\n",
+                    output_path, cairo_status_to_string(status));
+            return -1;
+        }
+        return 0;
+    }
+
+    uint64_t peak = 0;
+    for (int i = 0; i < HISTO_BIN_COUNT; i++) {
+        if (histogram[i] > peak) {
+            peak = histogram[i];
+        }
+    }
+
+    double axis_max = nice_axis_max(peak > 0 ? (double)peak * 1.1 : 1.0);
+
+    const int y_divisions = 5;
+    for (int i = 0; i <= y_divisions; i++) {
+        double value = axis_max * (double)i / (double)y_divisions;
+        double y = plot_bottom - ((double)i / (double)y_divisions) * plot_height;
+
+        set_color(cr, COLOR_GRID);
+        cairo_set_line_width(cr, 1.0);
+        cairo_move_to(cr, plot_left, y);
+        cairo_line_to(cr, plot_left + plot_width, y);
+        cairo_stroke(cr);
+
+        char label[32];
+        if (axis_max < 10.0) {
+            snprintf(label, sizeof(label), "%.1f", value);
+        } else {
+            snprintf(label, sizeof(label), "%.0f", value);
+        }
+        draw_label(cr, label, plot_left - 12.0, y + 4.0, 11.0, false, COLOR_MUTED, 1.0);
+    }
+
+    draw_label(cr, "Packets", plot_left - 12.0, plot_top - 12.0, 11.0, true, COLOR_MUTED, 1.0);
+
+    double slot_width = plot_width / (double)HISTO_BIN_COUNT;
+    double bar_width = slot_width * 0.58;
+
+    for (int i = 0; i < HISTO_BIN_COUNT; i++) {
+        double center = plot_left + slot_width * ((double)i + 0.5);
+        double count = (double)histogram[i];
+        double bar_height = (count / axis_max) * plot_height;
+        double bar_top = plot_bottom - bar_height;
+
+        if (bar_height > 0.0) {
+            cairo_set_source_rgba(cr, 0x3b / 255.0, 0x82 / 255.0, 0xf6 / 255.0, 0.88);
+            cairo_rectangle(cr, center - bar_width / 2.0, bar_top, bar_width, bar_height);
+            cairo_fill(cr);
+
+            set_color(cr, COLOR_TCP);
+            cairo_set_line_width(cr, 1.0);
+            cairo_rectangle(cr, center - bar_width / 2.0, bar_top, bar_width, bar_height);
+            cairo_stroke(cr);
+        }
+
+        char value_label[48];
+        double percentage = total > 0 ? 100.0 * count / (double)total : 0.0;
+        if (histogram[i] > 0) {
+            snprintf(value_label, sizeof(value_label), "%lu (%.1f%%)",
+                     (unsigned long)histogram[i], percentage);
+        } else {
+            snprintf(value_label, sizeof(value_label), "0");
+        }
+        draw_label(cr, value_label, center,
+                   bar_height > 0.0 ? bar_top - 8.0 : plot_bottom - 8.0,
+                   10.0, false, COLOR_TEXT, 0.5);
+
+        draw_label(cr, HISTO_BIN_LABELS[i], center, plot_bottom + 24.0,
+                   10.0, false, COLOR_MUTED, 0.5);
+    }
+
+    draw_label(cr, "Packet size bin", plot_left + plot_width / 2.0,
+               CHART_HEIGHT - 20.0, 12.0, true, COLOR_MUTED, 0.5);
+
+    cairo_show_page(cr);
+    cairo_destroy(cr);
+
+    cairo_status_t status = cairo_surface_write_to_png(surface, output_path);
+    cairo_surface_destroy(surface);
+
+    if (status != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Failed to write PNG '%s': %s\n",
+                output_path, cairo_status_to_string(status));
+        return -1;
+    }
+
+    return 0;
+}
