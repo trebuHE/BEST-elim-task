@@ -1,0 +1,17 @@
+# Build artifacts
+*.o
+*.a
+*.so
+bin/
+build/
+
+# Executables
+pcap_analyzer
+generate_test_pcap
+
+# Output files
+*.pcap
+*.pdf
+*.png
+charts/
+output/
