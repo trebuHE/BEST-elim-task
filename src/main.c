@@ -4,11 +4,16 @@
 #include <getopt.h>
 #include "analyzer_types.h"
 #include "pcap_parser.h"
+#include "stats.h"
 
 static void packet_printer_cb(const packet_record_t *pkt, void *user_data) {
-    (void)user_data;
-    /* Optional verbose debug display if needed */
-    (void)pkt;
+    traffic_stats_process_packet(pkt, user_data);
+    printf("[%ld.%06ld] %s:%u -> %s:%u [%s] len=%u\n",
+           (long)pkt->timestamp.tv_sec, (long)pkt->timestamp.tv_usec,
+           pkt->src_ip, pkt->src_port,
+           pkt->dst_ip, pkt->dst_port,
+           pkt->protocol == PROTO_TCP ? "TCP" : "UDP",
+           pkt->wirelen);
 }
 
 static void print_usage(const char *progname) {
@@ -48,18 +53,24 @@ int main(int argc, char *argv[]) {
     const char *pcap_file = argv[optind];
     char errbuf[512] = {0};
     parser_stats_t stats;
+    traffic_stats_t *tstats = traffic_stats_init();
+    if (!tstats) {
+        fprintf(stderr, "Error: failed to initialize traffic statistics engine.\n");
+        return 1;
+    }
 
     printf("[*] Analyzing PCAP file: %s\n", pcap_file);
 
     int ret = pcap_parser_process_file(pcap_file,
-                                       verbose ? packet_printer_cb : NULL,
-                                       NULL,
+                                       verbose ? packet_printer_cb : traffic_stats_process_packet,
+                                       tstats,
                                        &stats,
                                        errbuf,
                                        sizeof(errbuf));
 
     if (ret != 0) {
         fprintf(stderr, "[-] Parsing failed: %s\n", errbuf);
+        traffic_stats_free(tstats);
         return 1;
     }
 
@@ -67,20 +78,68 @@ int main(int argc, char *argv[]) {
                       (stats.end_time.tv_usec - stats.start_time.tv_usec) / 1000000.0;
     if (duration < 0) duration = 0.0;
 
-    printf("[+] Successfully parsed PCAP:\n");
-    printf("    - Total packets:      %lu\n", (unsigned long)stats.total_packets);
-    printf("    - Total volume:       %.2f KB (%lu bytes)\n",
+    printf("\n=== Summary Metrics ===\n");
+    printf("  - Total packets:        %lu\n", (unsigned long)stats.total_packets);
+    printf("  - Total volume:         %.2f KB (%lu bytes)\n",
            stats.total_bytes / 1024.0, (unsigned long)stats.total_bytes);
-    printf("    - IPv4 packets:       %lu\n", (unsigned long)stats.ipv4_packets);
-    printf("    - IPv6 packets:       %lu\n", (unsigned long)stats.ipv6_packets);
-    printf("    - TCP packets:        %lu\n", (unsigned long)stats.tcp_packets);
-    printf("    - UDP packets:        %lu\n", (unsigned long)stats.udp_packets);
-    printf("    - Duration:           %.3f seconds\n", duration);
+    printf("  - Protocol breakdown:   TCP: %lu, UDP: %lu\n",
+           (unsigned long)stats.tcp_packets, (unsigned long)stats.udp_packets);
+    printf("  - Duration:             %.3f seconds\n", duration);
     if (duration > 0.0) {
-        printf("    - Average rate:       %.2f packets/s (%.2f KB/s)\n",
+        printf("  - Average rate:         %.2f packets/s (%.2f KB/s)\n",
                stats.total_packets / duration,
                (stats.total_bytes / 1024.0) / duration);
     }
 
+    /* 1. Top Talkers */
+    ip_talker_stat_t top_talkers[5];
+    size_t talker_count = traffic_stats_get_top_talkers(tstats, top_talkers, 5);
+    printf("\n--- Top %zu Talkers ---\n", talker_count);
+    printf("  %-18s %-12s %-12s %-12s\n", "IP Address", "Total Bytes", "Sent (pkts)", "Recv (pkts)");
+    for (size_t i = 0; i < talker_count; i++) {
+        printf("  %-18s %-12lu %lu (%lu)     %lu (%lu)\n",
+               top_talkers[i].ip,
+               (unsigned long)top_talkers[i].total_bytes,
+               (unsigned long)top_talkers[i].bytes_sent,
+               (unsigned long)top_talkers[i].pkts_sent,
+               (unsigned long)top_talkers[i].bytes_recv,
+               (unsigned long)top_talkers[i].pkts_recv);
+    }
+
+    /* 2. Top Destination Ports */
+    port_stat_t top_ports[5];
+    size_t port_cnt = traffic_stats_get_top_ports(tstats, top_ports, 5);
+    printf("\n--- Top %zu Target Ports ---\n", port_cnt);
+    printf("  %-10s %-8s %-12s %-12s\n", "Port", "Proto", "Packets", "Bytes");
+    for (size_t i = 0; i < port_cnt; i++) {
+        printf("  %-10u %-8s %-12lu %-12lu\n",
+               top_ports[i].port,
+               top_ports[i].proto == PROTO_TCP ? "TCP" : "UDP",
+               (unsigned long)top_ports[i].packet_count,
+               (unsigned long)top_ports[i].byte_count);
+    }
+
+    /* 3. Packet Size Histogram */
+    const uint64_t *histo = traffic_stats_get_histogram(tstats);
+    printf("\n--- Packet Size Histogram ---\n");
+    for (int b = 0; b < HISTO_BIN_COUNT; b++) {
+        printf("  %-12s: %lu packets\n", HISTO_BIN_LABELS[b], (unsigned long)histo[b]);
+    }
+
+    /* 4. TCP Flags */
+    flag_stats_t flags = traffic_stats_get_flag_stats(tstats);
+    printf("\n--- TCP Flag Breakdown ---\n");
+    printf("  SYN: %lu | SYN-ACK: %lu | ACK: %lu | PSH-ACK: %lu | FIN-ACK: %lu | RST: %lu\n",
+           (unsigned long)flags.syn, (unsigned long)flags.syn_ack,
+           (unsigned long)flags.ack, (unsigned long)flags.psh_ack,
+           (unsigned long)flags.fin_ack, (unsigned long)flags.rst);
+    if (flags.null_scan || flags.xmas_scan || flags.syn_fin) {
+        printf("  [!] Anomalous flags detected: NULL=%lu, XMAS=%lu, SYN-FIN=%lu\n",
+               (unsigned long)flags.null_scan,
+               (unsigned long)flags.xmas_scan,
+               (unsigned long)flags.syn_fin);
+    }
+
+    traffic_stats_free(tstats);
     return 0;
 }
