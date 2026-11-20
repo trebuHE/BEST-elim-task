@@ -162,6 +162,16 @@ int main(int argc, char *argv[]) {
                      IPPROTO_TCP, TH_SYN | TH_FIN, 0);
     }
 
+    /* 5. Threat 3 Simulation: Horizontal Network Sweep */
+    /* Attacker 10.0.0.55 sweeps port 22 (SSH) across 15 distinct hosts */
+    for (int host = 100; host <= 114; host++) {
+        char target_ip[32];
+        snprintf(target_ip, sizeof(target_ip), "192.168.1.%d", host);
+        tv.tv_usec += 3000;
+        if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
+        write_packet(dumper, &tv, "10.0.0.55", target_ip, 49999, 22, IPPROTO_TCP, TH_SYN, 0);
+    }
+
     pcap_dump_close(dumper);
     pcap_close(dead);
     printf("[+] Generated test PCAP: %s\n", out_path);
