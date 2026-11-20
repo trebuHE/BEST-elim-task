@@ -432,3 +432,199 @@ int charts_generate_packet_size_histogram(const traffic_stats_t *stats, const ch
 
     return 0;
 }
+
+static void draw_legend_box(cairo_t *cr, double x, double y, uint32_t color, const char *label) {
+    set_color(cr, color);
+    cairo_rectangle(cr, x - 6.0, y - 6.0, 12.0, 12.0);
+    cairo_fill(cr);
+    draw_label(cr, label, x + 12.0, y + 4.0, 12.0, false, COLOR_TEXT, 0.0);
+}
+
+static void volume_unit(double max_bytes, double *divisor, const char **unit) {
+    if (max_bytes >= 1024.0 * 1024.0 * 1024.0) {
+        *divisor = 1024.0 * 1024.0 * 1024.0;
+        *unit = "GB";
+    } else if (max_bytes >= 1024.0 * 1024.0) {
+        *divisor = 1024.0 * 1024.0;
+        *unit = "MB";
+    } else if (max_bytes >= 1024.0) {
+        *divisor = 1024.0;
+        *unit = "KB";
+    } else {
+        *divisor = 1.0;
+        *unit = "B";
+    }
+}
+
+int charts_generate_top_talkers(const traffic_stats_t *stats, const char *output_path) {
+    if (!stats || !output_path || output_path[0] == '\0') {
+        fprintf(stderr, "Invalid top talkers chart arguments\n");
+        return -1;
+    }
+
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                          CHART_WIDTH, CHART_HEIGHT);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Failed to create chart surface\n");
+        cairo_surface_destroy(surface);
+        return -1;
+    }
+
+    cairo_t *cr = cairo_create(surface);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+
+    set_color(cr, COLOR_BG);
+    cairo_paint(cr);
+
+    draw_label(cr, "Top Talkers", PLOT_LEFT, 38.0, 24.0, true, COLOR_TEXT, 0.0);
+
+    ip_talker_stat_t talkers[10];
+    size_t count = traffic_stats_get_top_talkers(stats, talkers, 10);
+
+    char subtitle[96];
+    snprintf(subtitle, sizeof(subtitle), "Top %zu endpoints by bytes sent and received", count);
+    draw_label(cr, subtitle, PLOT_LEFT, 60.0, 12.0, false, COLOR_MUTED, 0.0);
+
+    double plot_left = 270.0;
+    double plot_top = PLOT_TOP;
+    double plot_width = CHART_WIDTH - plot_left - PLOT_RIGHT;
+    double plot_height = CHART_HEIGHT - PLOT_TOP - PLOT_BOTTOM;
+    double plot_bottom = plot_top + plot_height;
+
+    set_color(cr, COLOR_PLOT_BG);
+    cairo_rectangle(cr, plot_left, plot_top, plot_width, plot_height);
+    cairo_fill(cr);
+
+    cairo_set_line_width(cr, 1.0);
+    set_color(cr, COLOR_BORDER);
+    cairo_rectangle(cr, plot_left, plot_top, plot_width, plot_height);
+    cairo_stroke(cr);
+
+    if (count == 0) {
+        draw_label(cr, "No talker data", plot_left + plot_width / 2.0,
+                   plot_top + plot_height / 2.0, 18.0, true, COLOR_MUTED, 0.5);
+        cairo_show_page(cr);
+        cairo_destroy(cr);
+        cairo_status_t status = cairo_surface_write_to_png(surface, output_path);
+        cairo_surface_destroy(surface);
+
+        if (status != CAIRO_STATUS_SUCCESS) {
+            fprintf(stderr, "Failed to write PNG '%s': %s\n",
+                    output_path, cairo_status_to_string(status));
+            return -1;
+        }
+        return 0;
+    }
+
+    uint64_t peak_bytes = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t total_bytes = talkers[i].bytes_sent + talkers[i].bytes_recv;
+        if (total_bytes > peak_bytes) {
+            peak_bytes = total_bytes;
+        }
+    }
+
+    double divisor = 1.0;
+    const char *unit = "B";
+    volume_unit((double)peak_bytes, &divisor, &unit);
+
+    double axis_max = nice_axis_max(peak_bytes > 0 ? ((double)peak_bytes / divisor) * 1.15 : 1.0);
+
+    const int x_divisions = 5;
+    for (int i = 0; i <= x_divisions; i++) {
+        double value = axis_max * (double)i / (double)x_divisions;
+        double x = plot_left + ((double)i / (double)x_divisions) * plot_width;
+
+        set_color(cr, COLOR_GRID);
+        cairo_set_line_width(cr, 1.0);
+        cairo_move_to(cr, x, plot_top);
+        cairo_line_to(cr, x, plot_bottom);
+        cairo_stroke(cr);
+
+        char label[32];
+        if (axis_max < 10.0) {
+            snprintf(label, sizeof(label), "%.1f", value);
+        } else {
+            snprintf(label, sizeof(label), "%.0f", value);
+        }
+        draw_label(cr, label, x, plot_bottom + 24.0, 11.0, false, COLOR_MUTED, 0.5);
+    }
+
+    char axis_title[64];
+    snprintf(axis_title, sizeof(axis_title), "Traffic volume (%s)", unit);
+    draw_label(cr, axis_title, plot_left + plot_width / 2.0,
+               CHART_HEIGHT - 20.0, 12.0, true, COLOR_MUTED, 0.5);
+
+    double slot_height = plot_height / (double)count;
+    double bar_height = slot_height * 0.55;
+    if (bar_height > 42.0) {
+        bar_height = 42.0;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        double center_y = plot_top + slot_height * ((double)i + 0.5);
+        double bar_y = center_y - bar_height / 2.0;
+
+        double total_units = (double)(talkers[i].bytes_sent + talkers[i].bytes_recv) / divisor;
+        double sent_units = (double)talkers[i].bytes_sent / divisor;
+
+        double total_width = (total_units / axis_max) * plot_width;
+        double sent_width = (sent_units / axis_max) * plot_width;
+        if (sent_width > total_width) {
+            sent_width = total_width;
+        }
+        double recv_width = total_width - sent_width;
+
+        if (sent_width > 0.0) {
+            set_color(cr, COLOR_TCP);
+            cairo_rectangle(cr, plot_left, bar_y, sent_width, bar_height);
+            cairo_fill(cr);
+        }
+        if (recv_width > 0.0) {
+            set_color(cr, COLOR_UDP);
+            cairo_rectangle(cr, plot_left + sent_width, bar_y, recv_width, bar_height);
+            cairo_fill(cr);
+        }
+
+        set_color(cr, COLOR_BORDER);
+        cairo_set_line_width(cr, 0.8);
+        cairo_rectangle(cr, plot_left, bar_y, total_width, bar_height);
+        cairo_stroke(cr);
+
+        draw_label(cr, talkers[i].ip, plot_left - 12.0, center_y + 4.0,
+                   10.0, false, COLOR_TEXT, 1.0);
+
+        char value_label[64];
+        if (divisor == 1.0) {
+            snprintf(value_label, sizeof(value_label), "%.0f %s",
+                     (double)talkers[i].total_bytes, unit);
+        } else {
+            snprintf(value_label, sizeof(value_label), "%.1f %s",
+                     (double)talkers[i].total_bytes / divisor, unit);
+        }
+        draw_label(cr, value_label, plot_left + total_width + 8.0, center_y + 4.0,
+                   10.0, false, COLOR_MUTED, 0.0);
+    }
+
+    set_color(cr, COLOR_BORDER);
+    cairo_set_line_width(cr, 1.5);
+    cairo_rectangle(cr, plot_left, plot_top, plot_width, plot_height);
+    cairo_stroke(cr);
+
+    draw_legend_box(cr, CHART_WIDTH - PLOT_RIGHT - 210.0, PLOT_TOP - 30.0, COLOR_TCP, "Sent");
+    draw_legend_box(cr, CHART_WIDTH - PLOT_RIGHT - 130.0, PLOT_TOP - 30.0, COLOR_UDP, "Received");
+
+    cairo_show_page(cr);
+    cairo_destroy(cr);
+
+    cairo_status_t status = cairo_surface_write_to_png(surface, output_path);
+    cairo_surface_destroy(surface);
+
+    if (status != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Failed to write PNG '%s': %s\n",
+                output_path, cairo_status_to_string(status));
+        return -1;
+    }
+
+    return 0;
+}
