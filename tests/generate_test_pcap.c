@@ -180,6 +180,14 @@ int main(int argc, char *argv[]) {
         write_packet(dumper, &tv, "10.0.0.44", "192.168.1.50", 40000 + (uint16_t)i, 80, IPPROTO_TCP, TH_SYN, 0);
     }
 
+    /* UDP Flood */
+    /* Attacker 10.0.0.33 sends 75 rapid UDP packets to victim 192.168.1.200:53 */
+    for (int i = 0; i < 75; i++) {
+        tv.tv_usec += 800;
+        if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
+        write_packet(dumper, &tv, "10.0.0.33", "192.168.1.200", 35000 + (uint16_t)i, 53, IPPROTO_UDP, 0, 512);
+    }
+
     pcap_dump_close(dumper);
     pcap_close(dead);
     printf("[+] Generated test PCAP: %s\n", out_path);
