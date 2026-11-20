@@ -1,6 +1,6 @@
 # PCAP Traffic Analyzer
 
-A lightweight Linux network analysis tool written in C. It analyzes TCP and UDP traffic from `.pcap` files, computes traffic statistics, detects suspicious activity with heuristic checks, and generates publication-ready PNG charts using Cairo. PDF report generation is planned as the next stage.
+A lightweight Linux network analysis tool written in C. It analyzes TCP and UDP traffic from `.pcap` files, computes traffic statistics, detects suspicious activity with heuristic checks, and generates publication-ready PNG charts and a multi-page PDF report using Cairo.
 
 ## Features
 
@@ -28,8 +28,10 @@ A lightweight Linux network analysis tool written in C. It analyzes TCP and UDP 
   - Generated directly with Cairo.
   - Fixed 1000x600 resolution.
 
-- **PDF Report** *(planned)*
-  - Multi-page report with executive summary, traffic metrics, threat logs, and embedded charts.
+- **PDF Report**
+  - Multi-page A4 report with capture metadata, traffic metric cards, severity summary, embedded charts, and detailed threat findings.
+  - Charts are generated automatically in a temporary directory and cleaned up after the PDF is written.
+  - Alerts are sorted by severity in the report.
 
 ## Detection Heuristics
 
@@ -52,6 +54,20 @@ Pass `--charts-dir DIR` to write the following files:
 | `top_talkers.png` | Top endpoints by sent and received bytes |
 | `top_ports.png` | Top destination ports by packet count |
 | `tcp_flags.png` | TCP flag and scan-signature distribution |
+
+## PDF Report
+
+Pass `--pdf FILE` to generate an A4 PDF report. The report embeds the five charts automatically and includes capture metadata, security summary, and detailed threat findings.
+
+```bash
+./pcap_analyzer --pdf report.pdf capture.pcap
+```
+
+Charts and the PDF can be generated together:
+
+```bash
+./pcap_analyzer --charts-dir charts --pdf report.pdf capture.pcap
+```
 
 ## Dependencies
 
@@ -107,6 +123,7 @@ make clean
 - `-h`, `--help`: Display usage information.
 - `-v`, `--verbose`: Print the packet stream during parsing.
 - `-c`, `--charts-dir DIR`: Write PNG charts into `DIR`, creating it if needed.
+- `-o`, `--pdf FILE`: Write a PDF report to `FILE`.
 
 ### Examples
 
@@ -116,7 +133,19 @@ Analyze a capture and generate charts:
 ./pcap_analyzer --charts-dir charts capture.pcap
 ```
 
-Analyze a capture without charts:
+Generate a PDF report:
+
+```bash
+./pcap_analyzer --pdf report.pdf capture.pcap
+```
+
+Generate both:
+
+```bash
+./pcap_analyzer --charts-dir charts --pdf report.pdf capture.pcap
+```
+
+Analyze a capture without charts or PDF:
 
 ```bash
 ./pcap_analyzer capture.pcap
@@ -135,11 +164,35 @@ The repository includes a synthetic PCAP generator under `tests/`. It creates HT
 ```bash
 make generate_test_pcap
 ./generate_test_pcap sample_traffic.pcap
-./pcap_analyzer --charts-dir charts sample_traffic.pcap
+./pcap_analyzer --charts-dir charts --pdf report.pdf sample_traffic.pcap
 ```
 
 Run the existing test target:
 
 ```bash
 make test
+```
+
+## Project Structure
+
+```text
+.
+├── Makefile
+├── README.md
+├── include/
+│   ├── analyzer_types.h
+│   ├── pcap_parser.h
+│   ├── stats.h
+│   ├── detector.h
+│   ├── charts.h
+│   └── report.h
+├── src/
+│   ├── main.c
+│   ├── pcap_parser.c
+│   ├── stats.c
+│   ├── detector.c
+│   ├── charts.c
+│   └── report.c
+└── tests/
+    └── generate_test_pcap.c
 ```

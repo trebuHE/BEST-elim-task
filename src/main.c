@@ -9,6 +9,7 @@
 #include "stats.h"
 #include "detector.h"
 #include "charts.h"
+#include "report.h"
 
 typedef struct {
     traffic_stats_t   *stats;
@@ -69,6 +70,7 @@ static void print_usage(const char *progname) {
     printf("  -h, --help            Show this help message\n");
     printf("  -v, --verbose         Enable verbose packet stream output\n");
     printf("  -c, --charts-dir DIR  Write PNG charts into DIR\n");
+    printf("  -o, --pdf FILE        Write PDF report to FILE\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -76,19 +78,25 @@ int main(int argc, char *argv[]) {
         {"help",       no_argument,       0, 'h'},
         {"verbose",    no_argument,       0, 'v'},
         {"charts-dir", required_argument, 0, 'c'},
+        {"pdf",        required_argument, 0, 'o'},
         {0, 0, 0, 0}
     };
 
     bool verbose = false;
+    bool report_failed = false;
     const char *charts_dir = NULL;
+    const char *pdf_path = NULL;
     int opt = 0;
-    while ((opt = getopt_long(argc, argv, "hvc:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hvco:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'v':
                 verbose = true;
                 break;
             case 'c':
                 charts_dir = optarg;
+                break;
+            case 'o':
+                pdf_path = optarg;
                 break;
             case 'h':
             default:
@@ -242,7 +250,16 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (pdf_path) {
+        if (report_generate_pdf(pcap_file, &stats, tstats, detector, pdf_path) == 0) {
+            printf("[+] PDF report saved: %s\n", pdf_path);
+        } else {
+            fprintf(stderr, "[-] Failed to generate PDF report: %s\n", pdf_path);
+            report_failed = true;
+        }
+    }
+
     threat_detector_free(detector);
     traffic_stats_free(tstats);
-    return 0;
+    return report_failed ? 1 : 0;
 }
