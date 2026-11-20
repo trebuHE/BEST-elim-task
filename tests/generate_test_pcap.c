@@ -109,7 +109,7 @@ int main(int argc, char *argv[]) {
 
     struct timeval tv = { .tv_sec = 1700000000, .tv_usec = 0 };
 
-    /* 1. Simulate TCP HTTP/HTTPS flows */
+    /* Simulate TCP HTTP/HTTPS flows */
     for (int i = 0; i < 50; i++) {
         tv.tv_usec += 10000;
         if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
@@ -123,7 +123,7 @@ int main(int argc, char *argv[]) {
         write_packet(dumper, &tv, "192.168.1.10", "142.250.190.46", 45000 + i, 443, IPPROTO_TCP, TH_ACK | TH_PUSH, 512 + (i * 10));
     }
 
-    /* 2. Simulate UDP DNS queries */
+    /* Simulate UDP DNS queries */
     for (int i = 0; i < 30; i++) {
         tv.tv_usec += 15000;
         if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
@@ -131,22 +131,22 @@ int main(int argc, char *argv[]) {
         write_packet(dumper, &tv, "8.8.8.8", "192.168.1.15", 53, 53000 + i, IPPROTO_UDP, 0, 128);
     }
 
-    /* 3. Simulate Port Scan from an attacker (SYN scan across ports 20..45) */
+    /* Simulate Port Scan from an attacker (SYN scan across ports 20..45) */
     for (int port = 20; port <= 45; port++) {
         tv.tv_usec += 5000;
         if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
         write_packet(dumper, &tv, "10.0.0.99", "192.168.1.1", 33333, (uint16_t)port, IPPROTO_TCP, TH_SYN, 0);
     }
 
-    /* 4. Threat 1 Simulation: Stealth & Malformed Scans */
-    /* 4a. NULL Scan (no flags set) */
+    /* Stealth & Malformed Scans */
+    /* NULL Scan (no flags set) */
     for (int port = 80; port <= 82; port++) {
         tv.tv_usec += 4000;
         if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
         write_packet(dumper, &tv, "10.0.0.66", "192.168.1.1", 44444, (uint16_t)port, IPPROTO_TCP, 0, 0);
     }
 
-    /* 4b. XMAS Scan (FIN + PSH + URG) */
+    /* XMAS Scan (FIN + PSH + URG) */
     for (int port = 135; port <= 139; port++) {
         tv.tv_usec += 4000;
         if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
@@ -154,7 +154,7 @@ int main(int argc, char *argv[]) {
                      IPPROTO_TCP, TH_FIN | TH_PUSH | TH_URG, 0);
     }
 
-    /* 4c. SYN-FIN Malformed Scan */
+    /* SYN-FIN Malformed Scan */
     for (int port = 21; port <= 23; port++) {
         tv.tv_usec += 4000;
         if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
@@ -162,7 +162,7 @@ int main(int argc, char *argv[]) {
                      IPPROTO_TCP, TH_SYN | TH_FIN, 0);
     }
 
-    /* 5. Threat 3 Simulation: Horizontal Network Sweep */
+    /* Horizontal Network Sweep */
     /* Attacker 10.0.0.55 sweeps port 22 (SSH) across 15 distinct hosts */
     for (int host = 100; host <= 114; host++) {
         char target_ip[32];
@@ -170,6 +170,14 @@ int main(int argc, char *argv[]) {
         tv.tv_usec += 3000;
         if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
         write_packet(dumper, &tv, "10.0.0.55", target_ip, 49999, 22, IPPROTO_TCP, TH_SYN, 0);
+    }
+
+    /* SYN Flood DoS */
+    /* Attacker 10.0.0.44 floods victim 192.168.1.50:80 with 60 unanswered SYNs */
+    for (int i = 0; i < 60; i++) {
+        tv.tv_usec += 1000;
+        if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
+        write_packet(dumper, &tv, "10.0.0.44", "192.168.1.50", 40000 + (uint16_t)i, 80, IPPROTO_TCP, TH_SYN, 0);
     }
 
     pcap_dump_close(dumper);
