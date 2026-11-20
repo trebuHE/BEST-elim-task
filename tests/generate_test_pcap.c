@@ -138,6 +138,30 @@ int main(int argc, char *argv[]) {
         write_packet(dumper, &tv, "10.0.0.99", "192.168.1.1", 33333, (uint16_t)port, IPPROTO_TCP, TH_SYN, 0);
     }
 
+    /* 4. Threat 1 Simulation: Stealth & Malformed Scans */
+    /* 4a. NULL Scan (no flags set) */
+    for (int port = 80; port <= 82; port++) {
+        tv.tv_usec += 4000;
+        if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
+        write_packet(dumper, &tv, "10.0.0.66", "192.168.1.1", 44444, (uint16_t)port, IPPROTO_TCP, 0, 0);
+    }
+
+    /* 4b. XMAS Scan (FIN + PSH + URG) */
+    for (int port = 135; port <= 139; port++) {
+        tv.tv_usec += 4000;
+        if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
+        write_packet(dumper, &tv, "10.0.0.77", "192.168.1.1", 55555, (uint16_t)port,
+                     IPPROTO_TCP, TH_FIN | TH_PUSH | TH_URG, 0);
+    }
+
+    /* 4c. SYN-FIN Malformed Scan */
+    for (int port = 21; port <= 23; port++) {
+        tv.tv_usec += 4000;
+        if (tv.tv_usec >= 1000000) { tv.tv_sec++; tv.tv_usec -= 1000000; }
+        write_packet(dumper, &tv, "10.0.0.88", "192.168.1.1", 56666, (uint16_t)port,
+                     IPPROTO_TCP, TH_SYN | TH_FIN, 0);
+    }
+
     pcap_dump_close(dumper);
     pcap_close(dead);
     printf("[+] Generated test PCAP: %s\n", out_path);
