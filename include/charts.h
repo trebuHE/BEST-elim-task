@@ -7,5 +7,6 @@ int charts_generate_throughput(const traffic_stats_t *stats, const char *output_
 int charts_generate_packet_size_histogram(const traffic_stats_t *stats, const char *output_path);
 int charts_generate_top_talkers(const traffic_stats_t *stats, const char *output_path);
 int charts_generate_top_ports(const traffic_stats_t *stats, const char *output_path);
+int charts_generate_tcp_flags(const traffic_stats_t *stats, const char *output_path);
 
 #endif /* CHARTS_H */

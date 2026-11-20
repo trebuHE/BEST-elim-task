@@ -237,6 +237,8 @@ int main(int argc, char *argv[]) {
                         charts_generate_top_talkers, "top talkers");
             write_chart(tstats, charts_dir, "top_ports.png",
                         charts_generate_top_ports, "top ports");
+            write_chart(tstats, charts_dir, "tcp_flags.png",
+                        charts_generate_tcp_flags, "TCP flags");
         }
     }
 
