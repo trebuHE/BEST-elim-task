@@ -3,10 +3,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define VERTICAL_SCAN_THRESHOLD 15
+#define TRACKER_HASH_SIZE 512
+
+typedef struct host_pair_tracker {
+    char      src_ip[MAX_IP_STR_LEN];
+    char      dst_ip[MAX_IP_STR_LEN];
+    uint16_t *scanned_ports;
+    size_t    port_count;
+    size_t    port_cap;
+    bool      alerted;
+    struct host_pair_tracker *next;
+} host_pair_tracker_t;
+
 struct threat_detector {
-    threat_alert_t *alerts;
-    size_t          alert_count;
-    size_t          alert_cap;
+    threat_alert_t      *alerts;
+    size_t               alert_count;
+    size_t               alert_cap;
+
+    /* Threat 2: Vertical scan tracking per host pair */
+    host_pair_tracker_t *trackers[TRACKER_HASH_SIZE];
 };
 
 const char *threat_severity_to_string(threat_severity_t sev) {
@@ -47,8 +63,53 @@ threat_detector_t *threat_detector_init(void) {
 
 void threat_detector_free(threat_detector_t *d) {
     if (!d) return;
+
+    for (size_t i = 0; i < TRACKER_HASH_SIZE; i++) {
+        host_pair_tracker_t *cur = d->trackers[i];
+        while (cur) {
+            host_pair_tracker_t *next = cur->next;
+            free(cur->scanned_ports);
+            free(cur);
+            cur = next;
+        }
+    }
+
     free(d->alerts);
     free(d);
+}
+
+static uint32_t hash_host_pair(const char *src, const char *dst) {
+    uint32_t h = 5381;
+    while (*src) h = ((h << 5) + h) + (unsigned char)*src++;
+    while (*dst) h = ((h << 5) + h) + (unsigned char)*dst++;
+    return h % TRACKER_HASH_SIZE;
+}
+
+static host_pair_tracker_t *find_or_create_tracker(threat_detector_t *d, const char *src, const char *dst) {
+    uint32_t idx = hash_host_pair(src, dst);
+    host_pair_tracker_t *cur = d->trackers[idx];
+    while (cur) {
+        if (strncmp(cur->src_ip, src, sizeof(cur->src_ip)) == 0 &&
+            strncmp(cur->dst_ip, dst, sizeof(cur->dst_ip)) == 0) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+
+    host_pair_tracker_t *node = calloc(1, sizeof(host_pair_tracker_t));
+    if (!node) return NULL;
+    snprintf(node->src_ip, sizeof(node->src_ip), "%s", src);
+    snprintf(node->dst_ip, sizeof(node->dst_ip), "%s", dst);
+    node->port_cap = 16;
+    node->scanned_ports = malloc(node->port_cap * sizeof(uint16_t));
+    if (!node->scanned_ports) {
+        free(node);
+        return NULL;
+    }
+
+    node->next = d->trackers[idx];
+    d->trackers[idx] = node;
+    return node;
 }
 
 static void add_or_update_alert(threat_detector_t *d,
@@ -125,11 +186,61 @@ static void check_stealth_scans(threat_detector_t *d, const packet_record_t *pkt
     }
 }
 
+/*
+ * Threat 2: Vertical Port Scan
+ * Detects single source scanning >= VERTICAL_SCAN_THRESHOLD distinct ports on a single host.
+ */
+static void check_vertical_scan(threat_detector_t *d, const packet_record_t *pkt) {
+    /* If source port is a well-known service (< 1024), this is a server responding, not a scanner */
+    if (pkt->src_port < 1024) {
+        return;
+    }
+
+    /* For TCP: Only pure SYN packets initiate scans (exclude SYN-ACK responses) */
+    if (pkt->protocol == PROTO_TCP) {
+        if ((pkt->tcp_flags & FLAG_SYN) == 0 || (pkt->tcp_flags & FLAG_ACK) != 0) {
+            return;
+        }
+    }
+
+    host_pair_tracker_t *tr = find_or_create_tracker(d, pkt->src_ip, pkt->dst_ip);
+    if (!tr) return;
+
+    /* Check if dst_port has already been recorded */
+    for (size_t i = 0; i < tr->port_count; i++) {
+        if (tr->scanned_ports[i] == pkt->dst_port) {
+            return;
+        }
+    }
+
+    /* Record new distinct target port */
+    if (tr->port_count >= tr->port_cap) {
+        size_t new_cap = tr->port_cap * 2;
+        uint16_t *resized = realloc(tr->scanned_ports, new_cap * sizeof(uint16_t));
+        if (!resized) return;
+        tr->scanned_ports = resized;
+        tr->port_cap = new_cap;
+    }
+    tr->scanned_ports[tr->port_count++] = pkt->dst_port;
+
+    if (tr->port_count >= VERTICAL_SCAN_THRESHOLD) {
+        char desc[128];
+        snprintf(desc, sizeof(desc), "Vertical port scan (%lu distinct ports probed via %s)",
+                 (unsigned long)tr->port_count,
+                 pkt->protocol == PROTO_TCP ? "TCP SYN" : "UDP");
+
+        add_or_update_alert(d, pkt, THREAT_PORT_SCAN_VERTICAL, SEV_HIGH, desc);
+    }
+}
+
 void threat_detector_process_packet(threat_detector_t *detector, const packet_record_t *pkt) {
     if (!detector || !pkt) return;
 
     /* Threat 1: Stealth & Malformed TCP scans */
     check_stealth_scans(detector, pkt);
+
+    /* Threat 2: Vertical Port Scan */
+    check_vertical_scan(detector, pkt);
 }
 
 void threat_detector_finalize(threat_detector_t *detector) {
