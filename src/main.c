@@ -2,16 +2,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include "analyzer_types.h"
 #include "pcap_parser.h"
 #include "stats.h"
 #include "detector.h"
+#include "charts.h"
 
 typedef struct {
     traffic_stats_t   *stats;
     threat_detector_t *detector;
     bool               verbose;
 } analysis_context_t;
+
+static int ensure_directory(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return 0;
+        }
+        errno = ENOTDIR;
+        return -1;
+    }
+    if (mkdir(path, 0755) == 0) {
+        return 0;
+    }
+    return -1;
+}
 
 static void packet_dispatcher_cb(const packet_record_t *pkt, void *user_data) {
     analysis_context_t *ctx = (analysis_context_t *)user_data;
@@ -34,21 +52,27 @@ static void print_usage(const char *progname) {
     printf("Options:\n");
     printf("  -h, --help            Show this help message\n");
     printf("  -v, --verbose         Enable verbose packet stream output\n");
+    printf("  -c, --charts-dir DIR  Write PNG charts into DIR\n");
 }
 
 int main(int argc, char *argv[]) {
     static struct option long_options[] = {
-        {"help",    no_argument, 0, 'h'},
-        {"verbose", no_argument, 0, 'v'},
+        {"help",       no_argument,       0, 'h'},
+        {"verbose",    no_argument,       0, 'v'},
+        {"charts-dir", required_argument, 0, 'c'},
         {0, 0, 0, 0}
     };
 
     bool verbose = false;
+    const char *charts_dir = NULL;
     int opt = 0;
-    while ((opt = getopt_long(argc, argv, "hv", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hvc:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'v':
                 verbose = true;
+                break;
+            case 'c':
+                charts_dir = optarg;
                 break;
             case 'h':
             default:
@@ -181,6 +205,24 @@ int main(int argc, char *argv[]) {
                    alerts[i].src_ip,
                    alerts[i].dst_ip,
                    alerts[i].description);
+        }
+    }
+
+    if (charts_dir) {
+        if (ensure_directory(charts_dir) != 0) {
+            fprintf(stderr, "[-] Cannot create charts directory '%s': %s\n",
+                    charts_dir, strerror(errno));
+        } else {
+            char chart_path[1024];
+            int written = snprintf(chart_path, sizeof(chart_path),
+                                   "%s/throughput_timeline.png", charts_dir);
+            if (written < 0 || (size_t)written >= sizeof(chart_path)) {
+                fprintf(stderr, "[-] Chart output path is too long\n");
+            } else if (charts_generate_throughput(tstats, chart_path) == 0) {
+                printf("\n[+] Chart saved: %s\n", chart_path);
+            } else {
+                fprintf(stderr, "[-] Failed to generate throughput chart\n");
+            }
         }
     }
 
