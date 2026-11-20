@@ -5,15 +5,28 @@
 #include "analyzer_types.h"
 #include "pcap_parser.h"
 #include "stats.h"
+#include "detector.h"
 
-static void packet_printer_cb(const packet_record_t *pkt, void *user_data) {
-    traffic_stats_process_packet(pkt, user_data);
-    printf("[%ld.%06ld] %s:%u -> %s:%u [%s] len=%u\n",
-           (long)pkt->timestamp.tv_sec, (long)pkt->timestamp.tv_usec,
-           pkt->src_ip, pkt->src_port,
-           pkt->dst_ip, pkt->dst_port,
-           pkt->protocol == PROTO_TCP ? "TCP" : "UDP",
-           pkt->wirelen);
+typedef struct {
+    traffic_stats_t   *stats;
+    threat_detector_t *detector;
+    bool               verbose;
+} analysis_context_t;
+
+static void packet_dispatcher_cb(const packet_record_t *pkt, void *user_data) {
+    analysis_context_t *ctx = (analysis_context_t *)user_data;
+
+    traffic_stats_process_packet(pkt, ctx->stats);
+    threat_detector_process_packet(ctx->detector, pkt);
+
+    if (ctx->verbose) {
+        printf("[%ld.%06ld] %s:%u -> %s:%u [%s] len=%u\n",
+               (long)pkt->timestamp.tv_sec, (long)pkt->timestamp.tv_usec,
+               pkt->src_ip, pkt->src_port,
+               pkt->dst_ip, pkt->dst_port,
+               pkt->protocol == PROTO_TCP ? "TCP" : "UDP",
+               pkt->wirelen);
+    }
 }
 
 static void print_usage(const char *progname) {
@@ -53,26 +66,43 @@ int main(int argc, char *argv[]) {
     const char *pcap_file = argv[optind];
     char errbuf[512] = {0};
     parser_stats_t stats;
+
     traffic_stats_t *tstats = traffic_stats_init();
     if (!tstats) {
         fprintf(stderr, "Error: failed to initialize traffic statistics engine.\n");
         return 1;
     }
 
+    threat_detector_t *detector = threat_detector_init();
+    if (!detector) {
+        fprintf(stderr, "Error: failed to initialize threat detection engine.\n");
+        traffic_stats_free(tstats);
+        return 1;
+    }
+
+    analysis_context_t ctx = {
+        .stats = tstats,
+        .detector = detector,
+        .verbose = verbose
+    };
+
     printf("[*] Analyzing PCAP file: %s\n", pcap_file);
 
     int ret = pcap_parser_process_file(pcap_file,
-                                       verbose ? packet_printer_cb : traffic_stats_process_packet,
-                                       tstats,
+                                       packet_dispatcher_cb,
+                                       &ctx,
                                        &stats,
                                        errbuf,
                                        sizeof(errbuf));
 
     if (ret != 0) {
         fprintf(stderr, "[-] Parsing failed: %s\n", errbuf);
+        threat_detector_free(detector);
         traffic_stats_free(tstats);
         return 1;
     }
+
+    threat_detector_finalize(detector);
 
     double duration = (stats.end_time.tv_sec - stats.start_time.tv_sec) +
                       (stats.end_time.tv_usec - stats.start_time.tv_usec) / 1000000.0;
@@ -133,13 +163,28 @@ int main(int argc, char *argv[]) {
            (unsigned long)flags.syn, (unsigned long)flags.syn_ack,
            (unsigned long)flags.ack, (unsigned long)flags.psh_ack,
            (unsigned long)flags.fin_ack, (unsigned long)flags.rst);
-    if (flags.null_scan || flags.xmas_scan || flags.syn_fin) {
-        printf("  [!] Anomalous flags detected: NULL=%lu, XMAS=%lu, SYN-FIN=%lu\n",
-               (unsigned long)flags.null_scan,
-               (unsigned long)flags.xmas_scan,
-               (unsigned long)flags.syn_fin);
+
+    /* 5. Threat Intelligence & Malicious Alerts */
+    const threat_alert_t *alerts = NULL;
+    size_t alert_count = threat_detector_get_alerts(detector, &alerts);
+
+    printf("\n=== Security Threat Alerts (%zu detected) ===\n", alert_count);
+    if (alert_count == 0) {
+        printf("  [+] No malicious or suspicious activity detected.\n");
+    } else {
+        printf("  %-10s %-26s %-16s -> %-16s %s\n",
+               "Severity", "Threat Type", "Source IP", "Target IP", "Description");
+        for (size_t i = 0; i < alert_count; i++) {
+            printf("  [%-7s] %-26s %-16s -> %-16s %s\n",
+                   threat_severity_to_string(alerts[i].severity),
+                   threat_type_to_string(alerts[i].type),
+                   alerts[i].src_ip,
+                   alerts[i].dst_ip,
+                   alerts[i].description);
+        }
     }
 
+    threat_detector_free(detector);
     traffic_stats_free(tstats);
     return 0;
 }
