@@ -31,6 +31,22 @@ static int ensure_directory(const char *path) {
     return -1;
 }
 
+static void write_chart(const traffic_stats_t *stats, const char *charts_dir,
+                        const char *filename,
+                        int (*generate)(const traffic_stats_t *, const char *),
+                        const char *description) {
+    char chart_path[1024];
+    int written = snprintf(chart_path, sizeof(chart_path), "%s/%s", charts_dir, filename);
+
+    if (written < 0 || (size_t)written >= sizeof(chart_path)) {
+        fprintf(stderr, "[-] Chart output path is too long\n");
+    } else if (generate(stats, chart_path) == 0) {
+        printf("[+] Chart saved: %s\n", chart_path);
+    } else {
+        fprintf(stderr, "[-] Failed to generate %s chart\n", description);
+    }
+}
+
 static void packet_dispatcher_cb(const packet_record_t *pkt, void *user_data) {
     analysis_context_t *ctx = (analysis_context_t *)user_data;
 
@@ -213,16 +229,10 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "[-] Cannot create charts directory '%s': %s\n",
                     charts_dir, strerror(errno));
         } else {
-            char chart_path[1024];
-            int written = snprintf(chart_path, sizeof(chart_path),
-                                   "%s/throughput_timeline.png", charts_dir);
-            if (written < 0 || (size_t)written >= sizeof(chart_path)) {
-                fprintf(stderr, "[-] Chart output path is too long\n");
-            } else if (charts_generate_throughput(tstats, chart_path) == 0) {
-                printf("\n[+] Chart saved: %s\n", chart_path);
-            } else {
-                fprintf(stderr, "[-] Failed to generate throughput chart\n");
-            }
+            write_chart(tstats, charts_dir, "throughput_timeline.png",
+                        charts_generate_throughput, "throughput");
+            write_chart(tstats, charts_dir, "packet_size_histogram.png",
+                        charts_generate_packet_size_histogram, "packet size histogram");
         }
     }
 
