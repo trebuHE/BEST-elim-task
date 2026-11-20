@@ -2,16 +2,51 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include "analyzer_types.h"
 #include "pcap_parser.h"
 #include "stats.h"
 #include "detector.h"
+#include "charts.h"
+#include "report.h"
 
 typedef struct {
     traffic_stats_t   *stats;
     threat_detector_t *detector;
     bool               verbose;
 } analysis_context_t;
+
+static int ensure_directory(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return 0;
+        }
+        errno = ENOTDIR;
+        return -1;
+    }
+    if (mkdir(path, 0755) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+static void write_chart(const traffic_stats_t *stats, const char *charts_dir,
+                        const char *filename,
+                        int (*generate)(const traffic_stats_t *, const char *),
+                        const char *description) {
+    char chart_path[1024];
+    int written = snprintf(chart_path, sizeof(chart_path), "%s/%s", charts_dir, filename);
+
+    if (written < 0 || (size_t)written >= sizeof(chart_path)) {
+        fprintf(stderr, "[-] Chart output path is too long\n");
+    } else if (generate(stats, chart_path) == 0) {
+        printf("[+] Chart saved: %s\n", chart_path);
+    } else {
+        fprintf(stderr, "[-] Failed to generate %s chart\n", description);
+    }
+}
 
 static void packet_dispatcher_cb(const packet_record_t *pkt, void *user_data) {
     analysis_context_t *ctx = (analysis_context_t *)user_data;
@@ -34,21 +69,34 @@ static void print_usage(const char *progname) {
     printf("Options:\n");
     printf("  -h, --help            Show this help message\n");
     printf("  -v, --verbose         Enable verbose packet stream output\n");
+    printf("  -c, --charts-dir DIR  Write PNG charts into DIR\n");
+    printf("  -o, --pdf FILE        Write PDF report to FILE\n");
 }
 
 int main(int argc, char *argv[]) {
     static struct option long_options[] = {
-        {"help",    no_argument, 0, 'h'},
-        {"verbose", no_argument, 0, 'v'},
+        {"help",       no_argument,       0, 'h'},
+        {"verbose",    no_argument,       0, 'v'},
+        {"charts-dir", required_argument, 0, 'c'},
+        {"pdf",        required_argument, 0, 'o'},
         {0, 0, 0, 0}
     };
 
     bool verbose = false;
+    bool report_failed = false;
+    const char *charts_dir = NULL;
+    const char *pdf_path = NULL;
     int opt = 0;
-    while ((opt = getopt_long(argc, argv, "hv", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hvco:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'v':
                 verbose = true;
+                break;
+            case 'c':
+                charts_dir = optarg;
+                break;
+            case 'o':
+                pdf_path = optarg;
                 break;
             case 'h':
             default:
@@ -184,7 +232,34 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (charts_dir) {
+        if (ensure_directory(charts_dir) != 0) {
+            fprintf(stderr, "[-] Cannot create charts directory '%s': %s\n",
+                    charts_dir, strerror(errno));
+        } else {
+            write_chart(tstats, charts_dir, "throughput_timeline.png",
+                        charts_generate_throughput, "throughput");
+            write_chart(tstats, charts_dir, "packet_size_histogram.png",
+                        charts_generate_packet_size_histogram, "packet size histogram");
+            write_chart(tstats, charts_dir, "top_talkers.png",
+                        charts_generate_top_talkers, "top talkers");
+            write_chart(tstats, charts_dir, "top_ports.png",
+                        charts_generate_top_ports, "top ports");
+            write_chart(tstats, charts_dir, "tcp_flags.png",
+                        charts_generate_tcp_flags, "TCP flags");
+        }
+    }
+
+    if (pdf_path) {
+        if (report_generate_pdf(pcap_file, &stats, tstats, detector, pdf_path) == 0) {
+            printf("[+] PDF report saved: %s\n", pdf_path);
+        } else {
+            fprintf(stderr, "[-] Failed to generate PDF report: %s\n", pdf_path);
+            report_failed = true;
+        }
+    }
+
     threat_detector_free(detector);
     traffic_stats_free(tstats);
-    return 0;
+    return report_failed ? 1 : 0;
 }
