@@ -5,8 +5,10 @@
 
 #define VERTICAL_SCAN_THRESHOLD   15
 #define HORIZONTAL_SCAN_THRESHOLD 10
-#define TRACKER_HASH_SIZE 512
-#define SWEEP_HASH_SIZE   512
+#define SYN_FLOOD_MIN_SYNS        40
+#define TRACKER_HASH_SIZE    512
+#define SWEEP_HASH_SIZE      512
+#define SYN_TARGET_HASH_SIZE 512
 
 typedef struct host_pair_tracker {
     char      src_ip[MAX_IP_STR_LEN];
@@ -29,16 +31,31 @@ typedef struct sweep_tracker {
     struct sweep_tracker *next;
 } sweep_tracker_t;
 
+typedef struct syn_target_tracker {
+    char           dst_ip[MAX_IP_STR_LEN];
+    uint16_t       dst_port;
+    uint64_t       syn_count;
+    uint64_t       ack_count;
+    char           dominant_src[MAX_IP_STR_LEN];
+    uint64_t       dominant_src_count;
+    struct timeval last_ts;
+    bool           alerted;
+    struct syn_target_tracker *next;
+} syn_target_tracker_t;
+
 struct threat_detector {
-    threat_alert_t      *alerts;
-    size_t               alert_count;
-    size_t               alert_cap;
+    threat_alert_t        *alerts;
+    size_t                 alert_count;
+    size_t                 alert_cap;
 
-    /* Threat 2: Vertical scan tracking per host pair */
-    host_pair_tracker_t *trackers[TRACKER_HASH_SIZE];
+    /* Vertical scan tracking per host pair */
+    host_pair_tracker_t   *trackers[TRACKER_HASH_SIZE];
 
-    /* Threat 3: Horizontal sweep tracking per (src_ip, port, proto) */
-    sweep_tracker_t     *sweeps[SWEEP_HASH_SIZE];
+    /* Horizontal sweep tracking per (src_ip, port, proto) */
+    sweep_tracker_t       *sweeps[SWEEP_HASH_SIZE];
+
+    /* YN flood tracking per destination (dst_ip, dst_port) */
+    syn_target_tracker_t  *syn_targets[SYN_TARGET_HASH_SIZE];
 };
 
 const char *threat_severity_to_string(threat_severity_t sev) {
@@ -100,6 +117,15 @@ void threat_detector_free(threat_detector_t *d) {
         }
     }
 
+    for (size_t i = 0; i < SYN_TARGET_HASH_SIZE; i++) {
+        syn_target_tracker_t *cur = d->syn_targets[i];
+        while (cur) {
+            syn_target_tracker_t *next = cur->next;
+            free(cur);
+            cur = next;
+        }
+    }
+
     free(d->alerts);
     free(d);
 }
@@ -143,6 +169,98 @@ static uint32_t hash_sweep(const char *src, uint16_t port, proto_type_t proto) {
     while (*src) h = ((h << 5) + h) + (unsigned char)*src++;
     h = h ^ ((uint32_t)port << 5) ^ ((uint32_t)proto << 13);
     return h % SWEEP_HASH_SIZE;
+}
+
+static uint32_t hash_syn_target(const char *dst, uint16_t port) {
+    uint32_t h = 5381;
+    while (*dst) h = ((h << 5) + h) + (unsigned char)*dst++;
+    h = h ^ ((uint32_t)port << 7);
+    return h % SYN_TARGET_HASH_SIZE;
+}
+
+static syn_target_tracker_t *find_or_create_syn_target(threat_detector_t *d, const char *dst, uint16_t port) {
+    uint32_t idx = hash_syn_target(dst, port);
+    syn_target_tracker_t *cur = d->syn_targets[idx];
+    while (cur) {
+        if (cur->dst_port == port && strncmp(cur->dst_ip, dst, sizeof(cur->dst_ip)) == 0) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+
+    syn_target_tracker_t *node = calloc(1, sizeof(syn_target_tracker_t));
+    if (!node) return NULL;
+    snprintf(node->dst_ip, sizeof(node->dst_ip), "%s", dst);
+    node->dst_port = port;
+
+    node->next = d->syn_targets[idx];
+    d->syn_targets[idx] = node;
+    return node;
+}
+
+static syn_target_tracker_t *find_syn_target(threat_detector_t *d, const char *dst, uint16_t port) {
+    uint32_t idx = hash_syn_target(dst, port);
+    syn_target_tracker_t *cur = d->syn_targets[idx];
+    while (cur) {
+        if (cur->dst_port == port && strncmp(cur->dst_ip, dst, sizeof(cur->dst_ip)) == 0) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+static void record_syn_flood_alert(threat_detector_t *d, const syn_target_tracker_t *tr) {
+    const char *attacker = (tr->dominant_src[0] != '\0') ? tr->dominant_src : "Distributed/Multiple";
+
+    double uncompleted_ratio = 100.0;
+    if (tr->syn_count > 0) {
+        if (tr->ack_count >= tr->syn_count) {
+            uncompleted_ratio = 0.0;
+        } else {
+            uncompleted_ratio = 100.0 * (1.0 - (double)tr->ack_count / (double)tr->syn_count);
+        }
+    }
+
+    for (size_t i = 0; i < d->alert_count; i++) {
+        threat_alert_t *a = &d->alerts[i];
+        if (a->type == THREAT_SYN_FLOOD &&
+            a->dst_port == tr->dst_port &&
+            strncmp(a->dst_ip, tr->dst_ip, sizeof(a->dst_ip)) == 0) {
+            
+            a->packet_count = tr->syn_count;
+            a->timestamp = tr->last_ts;
+            snprintf(a->description, sizeof(a->description),
+                     "SYN Flood DoS on port %u (%lu SYNs, %lu ACKs, %.1f%% uncompleted)",
+                     tr->dst_port, (unsigned long)tr->syn_count, (unsigned long)tr->ack_count,
+                     uncompleted_ratio);
+            return;
+        }
+    }
+
+    if (d->alert_count >= d->alert_cap) {
+        size_t new_cap = d->alert_cap * 2;
+        threat_alert_t *resized = realloc(d->alerts, new_cap * sizeof(threat_alert_t));
+        if (!resized) return;
+        d->alerts = resized;
+        d->alert_cap = new_cap;
+    }
+
+    threat_alert_t *new_alert = &d->alerts[d->alert_count++];
+    memset(new_alert, 0, sizeof(threat_alert_t));
+    new_alert->timestamp = tr->last_ts;
+    new_alert->type = THREAT_SYN_FLOOD;
+    new_alert->severity = SEV_CRITICAL;
+    snprintf(new_alert->src_ip, sizeof(new_alert->src_ip), "%s", attacker);
+    snprintf(new_alert->dst_ip, sizeof(new_alert->dst_ip), "%s", tr->dst_ip);
+    new_alert->src_port = 0;
+    new_alert->dst_port = tr->dst_port;
+    new_alert->protocol = PROTO_TCP;
+    new_alert->packet_count = tr->syn_count;
+    snprintf(new_alert->description, sizeof(new_alert->description),
+             "SYN Flood DoS on port %u (%lu SYNs, %lu ACKs, %.1f%% uncompleted)",
+             tr->dst_port, (unsigned long)tr->syn_count, (unsigned long)tr->ack_count,
+             uncompleted_ratio);
 }
 
 static sweep_tracker_t *find_or_create_sweep(threat_detector_t *d, const char *src, uint16_t port, proto_type_t proto) {
@@ -264,7 +382,7 @@ static void add_or_update_alert(threat_detector_t *d,
 }
 
 /*
- * Threat 1: Stealth & Malformed TCP Scans
+ * Stealth & Malformed TCP Scans
  * Detects NULL scans (0 flags), XMAS scans (FIN+PSH+URG), and SYN-FIN illegal combos.
  */
 static void check_stealth_scans(threat_detector_t *d, const packet_record_t *pkt) {
@@ -274,19 +392,19 @@ static void check_stealth_scans(threat_detector_t *d, const packet_record_t *pkt
 
     uint8_t flags = pkt->tcp_flags;
 
-    /* A. NULL Scan (No flags set) */
+    /* NULL Scan (No flags set) */
     if (flags == 0) {
         add_or_update_alert(d, pkt, THREAT_STEALTH_SCAN, SEV_MEDIUM, "TCP NULL scan (no flags set)");
         return;
     }
 
-    /* B. XMAS Scan (FIN, PSH, and URG set) */
+    /* XMAS Scan (FIN, PSH, and URG set) */
     if ((flags & (FLAG_FIN | FLAG_PSH | FLAG_URG)) == (FLAG_FIN | FLAG_PSH | FLAG_URG)) {
         add_or_update_alert(d, pkt, THREAT_STEALTH_SCAN, SEV_HIGH, "TCP XMAS scan (FIN+PSH+URG set)");
         return;
     }
 
-    /* C. SYN-FIN Malformed Combination */
+    /* SYN-FIN Malformed Combination */
     if ((flags & (FLAG_SYN | FLAG_FIN)) == (FLAG_SYN | FLAG_FIN)) {
         add_or_update_alert(d, pkt, THREAT_STEALTH_SCAN, SEV_HIGH, "TCP SYN-FIN malformed scan");
         return;
@@ -294,7 +412,7 @@ static void check_stealth_scans(threat_detector_t *d, const packet_record_t *pkt
 }
 
 /*
- * Threat 2: Vertical Port Scan
+ * Vertical Port Scan
  * Detects single source scanning >= VERTICAL_SCAN_THRESHOLD distinct ports on a single host.
  */
 static void check_vertical_scan(threat_detector_t *d, const packet_record_t *pkt) {
@@ -341,7 +459,7 @@ static void check_vertical_scan(threat_detector_t *d, const packet_record_t *pkt
 }
 
 /*
- * Threat 3: Horizontal Port Scan (Network Sweep)
+ * Horizontal Port Scan (Network Sweep)
  * Detects single source scanning the same port across >= HORIZONTAL_SCAN_THRESHOLD distinct hosts.
  */
 static void check_horizontal_scan(threat_detector_t *d, const packet_record_t *pkt) {
@@ -382,22 +500,74 @@ static void check_horizontal_scan(threat_detector_t *d, const packet_record_t *p
     }
 }
 
+/*
+ * SYN Flood / Incomplete Handshake DoS
+ * Detects excessive unacknowledged SYN packets directed at a victim port.
+ */
+static void check_syn_flood(threat_detector_t *d, const packet_record_t *pkt) {
+    if (pkt->protocol != PROTO_TCP) {
+        return;
+    }
+
+    bool is_syn = ((pkt->tcp_flags & FLAG_SYN) != 0 && (pkt->tcp_flags & FLAG_ACK) == 0);
+    bool is_ack = ((pkt->tcp_flags & FLAG_ACK) != 0);
+
+    if (is_syn) {
+        syn_target_tracker_t *tr = find_or_create_syn_target(d, pkt->dst_ip, pkt->dst_port);
+        if (!tr) return;
+
+        tr->syn_count++;
+        tr->last_ts = pkt->timestamp;
+
+        /* Boyer-Moore dominant source tracking */
+        if (tr->dominant_src[0] == '\0') {
+            snprintf(tr->dominant_src, sizeof(tr->dominant_src), "%s", pkt->src_ip);
+            tr->dominant_src_count = 1;
+        } else if (strncmp(tr->dominant_src, pkt->src_ip, sizeof(tr->dominant_src)) == 0) {
+            tr->dominant_src_count++;
+        } else if (tr->dominant_src_count > 0) {
+            tr->dominant_src_count--;
+        } else {
+            snprintf(tr->dominant_src, sizeof(tr->dominant_src), "%s", pkt->src_ip);
+            tr->dominant_src_count = 1;
+        }
+
+        if (tr->syn_count >= SYN_FLOOD_MIN_SYNS && tr->syn_count > 4 * (tr->ack_count + 1)) {
+            record_syn_flood_alert(d, tr);
+        }
+    } else if (is_ack) {
+        syn_target_tracker_t *tr = find_syn_target(d, pkt->dst_ip, pkt->dst_port);
+        if (tr) {
+            tr->ack_count++;
+            tr->last_ts = pkt->timestamp;
+        }
+    }
+}
+
 void threat_detector_process_packet(threat_detector_t *detector, const packet_record_t *pkt) {
     if (!detector || !pkt) return;
 
-    /* Threat 1: Stealth & Malformed TCP scans */
     check_stealth_scans(detector, pkt);
 
-    /* Threat 2: Vertical Port Scan */
     check_vertical_scan(detector, pkt);
 
-    /* Threat 3: Horizontal Port Scan (Network Sweep) */
     check_horizontal_scan(detector, pkt);
+
+    check_syn_flood(detector, pkt);
 }
 
 void threat_detector_finalize(threat_detector_t *detector) {
     if (!detector) return;
-    /* Will be used for sliding window flushes in subsequent threats */
+
+    for (size_t i = 0; i < SYN_TARGET_HASH_SIZE; i++) {
+        syn_target_tracker_t *tr = detector->syn_targets[i];
+        while (tr) {
+            if (tr->syn_count >= SYN_FLOOD_MIN_SYNS && tr->syn_count > 4 * (tr->ack_count + 1)) {
+                record_syn_flood_alert(detector, tr);
+            }
+            tr = tr->next;
+        }
+    }
 }
 
 size_t threat_detector_get_alerts(const threat_detector_t *detector, const threat_alert_t **out_alerts) {

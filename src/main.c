@@ -121,7 +121,7 @@ int main(int argc, char *argv[]) {
                (stats.total_bytes / 1024.0) / duration);
     }
 
-    /* 1. Top Talkers */
+    /* Top Talkers */
     ip_talker_stat_t top_talkers[5];
     size_t talker_count = traffic_stats_get_top_talkers(tstats, top_talkers, 5);
     printf("\n--- Top %zu Talkers ---\n", talker_count);
@@ -136,7 +136,7 @@ int main(int argc, char *argv[]) {
                (unsigned long)top_talkers[i].pkts_recv);
     }
 
-    /* 2. Top Destination Ports */
+    /* Top Destination Ports */
     port_stat_t top_ports[5];
     size_t port_cnt = traffic_stats_get_top_ports(tstats, top_ports, 5);
     printf("\n--- Top %zu Target Ports ---\n", port_cnt);
@@ -149,14 +149,14 @@ int main(int argc, char *argv[]) {
                (unsigned long)top_ports[i].byte_count);
     }
 
-    /* 3. Packet Size Histogram */
+    /* Packet Size Histogram */
     const uint64_t *histo = traffic_stats_get_histogram(tstats);
     printf("\n--- Packet Size Histogram ---\n");
     for (int b = 0; b < HISTO_BIN_COUNT; b++) {
         printf("  %-12s: %lu packets\n", HISTO_BIN_LABELS[b], (unsigned long)histo[b]);
     }
 
-    /* 4. TCP Flags */
+    /* TCP Flags */
     flag_stats_t flags = traffic_stats_get_flag_stats(tstats);
     printf("\n--- TCP Flag Breakdown ---\n");
     printf("  SYN: %lu | SYN-ACK: %lu | ACK: %lu | PSH-ACK: %lu | FIN-ACK: %lu | RST: %lu\n",
@@ -164,7 +164,7 @@ int main(int argc, char *argv[]) {
            (unsigned long)flags.ack, (unsigned long)flags.psh_ack,
            (unsigned long)flags.fin_ack, (unsigned long)flags.rst);
 
-    /* 5. Threat Intelligence & Malicious Alerts */
+    /* Threat Intelligence & Malicious Alerts */
     const threat_alert_t *alerts = NULL;
     size_t alert_count = threat_detector_get_alerts(detector, &alerts);
 
