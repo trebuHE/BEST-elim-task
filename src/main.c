@@ -235,6 +235,8 @@ int main(int argc, char *argv[]) {
                         charts_generate_packet_size_histogram, "packet size histogram");
             write_chart(tstats, charts_dir, "top_talkers.png",
                         charts_generate_top_talkers, "top talkers");
+            write_chart(tstats, charts_dir, "top_ports.png",
+                        charts_generate_top_ports, "top ports");
         }
     }
 

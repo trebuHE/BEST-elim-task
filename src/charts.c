@@ -628,3 +628,209 @@ int charts_generate_top_talkers(const traffic_stats_t *stats, const char *output
 
     return 0;
 }
+
+static const char *port_service_name(uint16_t port) {
+    switch (port) {
+        case 20: return "FTP-DATA";
+        case 21: return "FTP";
+        case 22: return "SSH";
+        case 23: return "Telnet";
+        case 25: return "SMTP";
+        case 53: return "DNS";
+        case 67: return "DHCP";
+        case 68: return "DHCP";
+        case 80: return "HTTP";
+        case 110: return "POP3";
+        case 123: return "NTP";
+        case 143: return "IMAP";
+        case 161: return "SNMP";
+        case 162: return "SNMP-Trap";
+        case 389: return "LDAP";
+        case 443: return "HTTPS";
+        case 445: return "SMB";
+        case 465: return "SMTPS";
+        case 514: return "Syslog";
+        case 587: return "SMTP";
+        case 636: return "LDAPS";
+        case 993: return "IMAPS";
+        case 995: return "POP3S";
+        case 1433: return "MSSQL";
+        case 1521: return "Oracle";
+        case 3306: return "MySQL";
+        case 3389: return "RDP";
+        case 5432: return "PostgreSQL";
+        case 6379: return "Redis";
+        case 8080: return "HTTP-Alt";
+        case 8443: return "HTTPS-Alt";
+        default: return NULL;
+    }
+}
+
+static void format_volume_brief(char *buffer, size_t size, uint64_t bytes) {
+    double divisor = 1.0;
+    const char *unit = "B";
+    volume_unit((double)bytes, &divisor, &unit);
+
+    if (divisor == 1.0) {
+        snprintf(buffer, size, "%.0f %s", (double)bytes, unit);
+    } else {
+        snprintf(buffer, size, "%.1f %s", (double)bytes / divisor, unit);
+    }
+}
+
+int charts_generate_top_ports(const traffic_stats_t *stats, const char *output_path) {
+    if (!stats || !output_path || output_path[0] == '\0') {
+        fprintf(stderr, "Invalid top ports chart arguments\n");
+        return -1;
+    }
+
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                          CHART_WIDTH, CHART_HEIGHT);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Failed to create chart surface\n");
+        cairo_surface_destroy(surface);
+        return -1;
+    }
+
+    cairo_t *cr = cairo_create(surface);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+
+    set_color(cr, COLOR_BG);
+    cairo_paint(cr);
+
+    draw_label(cr, "Top Target Ports", PLOT_LEFT, 38.0, 24.0, true, COLOR_TEXT, 0.0);
+
+    port_stat_t ports[10];
+    size_t count = traffic_stats_get_top_ports(stats, ports, 10);
+
+    char subtitle[96];
+    snprintf(subtitle, sizeof(subtitle), "Top %zu destination ports by packet count", count);
+    draw_label(cr, subtitle, PLOT_LEFT, 60.0, 12.0, false, COLOR_MUTED, 0.0);
+
+    double plot_left = 230.0;
+    double plot_top = PLOT_TOP;
+    double plot_width = CHART_WIDTH - plot_left - PLOT_RIGHT;
+    double plot_height = CHART_HEIGHT - PLOT_TOP - PLOT_BOTTOM;
+    double plot_bottom = plot_top + plot_height;
+
+    set_color(cr, COLOR_PLOT_BG);
+    cairo_rectangle(cr, plot_left, plot_top, plot_width, plot_height);
+    cairo_fill(cr);
+
+    cairo_set_line_width(cr, 1.0);
+    set_color(cr, COLOR_BORDER);
+    cairo_rectangle(cr, plot_left, plot_top, plot_width, plot_height);
+    cairo_stroke(cr);
+
+    if (count == 0) {
+        draw_label(cr, "No port data", plot_left + plot_width / 2.0,
+                   plot_top + plot_height / 2.0, 18.0, true, COLOR_MUTED, 0.5);
+        cairo_show_page(cr);
+        cairo_destroy(cr);
+        cairo_status_t status = cairo_surface_write_to_png(surface, output_path);
+        cairo_surface_destroy(surface);
+
+        if (status != CAIRO_STATUS_SUCCESS) {
+            fprintf(stderr, "Failed to write PNG '%s': %s\n",
+                    output_path, cairo_status_to_string(status));
+            return -1;
+        }
+        return 0;
+    }
+
+    uint64_t peak_packets = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (ports[i].packet_count > peak_packets) {
+            peak_packets = ports[i].packet_count;
+        }
+    }
+
+    double axis_max = nice_axis_max(peak_packets > 0 ? (double)peak_packets * 1.2 : 1.0);
+
+    const int x_divisions = 5;
+    for (int i = 0; i <= x_divisions; i++) {
+        double value = axis_max * (double)i / (double)x_divisions;
+        double x = plot_left + ((double)i / (double)x_divisions) * plot_width;
+
+        set_color(cr, COLOR_GRID);
+        cairo_set_line_width(cr, 1.0);
+        cairo_move_to(cr, x, plot_top);
+        cairo_line_to(cr, x, plot_bottom);
+        cairo_stroke(cr);
+
+        char label[32];
+        if (axis_max < 10.0) {
+            snprintf(label, sizeof(label), "%.1f", value);
+        } else {
+            snprintf(label, sizeof(label), "%.0f", value);
+        }
+        draw_label(cr, label, x, plot_bottom + 24.0, 11.0, false, COLOR_MUTED, 0.5);
+    }
+
+    draw_label(cr, "Packets", plot_left + plot_width / 2.0,
+               CHART_HEIGHT - 20.0, 12.0, true, COLOR_MUTED, 0.5);
+
+    double slot_height = plot_height / (double)count;
+    double bar_height = slot_height * 0.55;
+    if (bar_height > 42.0) {
+        bar_height = 42.0;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        double center_y = plot_top + slot_height * ((double)i + 0.5);
+        double bar_y = center_y - bar_height / 2.0;
+        double bar_width = ((double)ports[i].packet_count / axis_max) * plot_width;
+
+        set_color(cr, ports[i].proto == PROTO_TCP ? COLOR_TCP : COLOR_UDP);
+        cairo_rectangle(cr, plot_left, bar_y, bar_width, bar_height);
+        cairo_fill(cr);
+
+        set_color(cr, COLOR_BORDER);
+        cairo_set_line_width(cr, 0.8);
+        cairo_rectangle(cr, plot_left, bar_y, bar_width, bar_height);
+        cairo_stroke(cr);
+
+        const char *service = port_service_name(ports[i].port);
+        const char *proto = ports[i].proto == PROTO_TCP ? "TCP" : "UDP";
+        char port_label[64];
+        if (service) {
+            snprintf(port_label, sizeof(port_label), "%u/%s %s",
+                     ports[i].port, proto, service);
+        } else {
+            snprintf(port_label, sizeof(port_label), "%u/%s", ports[i].port, proto);
+        }
+        draw_label(cr, port_label, plot_left - 12.0, center_y + 4.0,
+                   10.0, false, COLOR_TEXT, 1.0);
+
+        char volume[32];
+        format_volume_brief(volume, sizeof(volume), ports[i].byte_count);
+
+        char value_label[96];
+        snprintf(value_label, sizeof(value_label), "%lu pkts (%s)",
+                 (unsigned long)ports[i].packet_count, volume);
+        draw_label(cr, value_label, plot_left + bar_width + 8.0, center_y + 4.0,
+                   10.0, false, COLOR_MUTED, 0.0);
+    }
+
+    set_color(cr, COLOR_BORDER);
+    cairo_set_line_width(cr, 1.5);
+    cairo_rectangle(cr, plot_left, plot_top, plot_width, plot_height);
+    cairo_stroke(cr);
+
+    draw_legend_box(cr, CHART_WIDTH - PLOT_RIGHT - 190.0, PLOT_TOP - 30.0, COLOR_TCP, "TCP");
+    draw_legend_box(cr, CHART_WIDTH - PLOT_RIGHT - 120.0, PLOT_TOP - 30.0, COLOR_UDP, "UDP");
+
+    cairo_show_page(cr);
+    cairo_destroy(cr);
+
+    cairo_status_t status = cairo_surface_write_to_png(surface, output_path);
+    cairo_surface_destroy(surface);
+
+    if (status != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Failed to write PNG '%s': %s\n",
+                output_path, cairo_status_to_string(status));
+        return -1;
+    }
+
+    return 0;
+}
